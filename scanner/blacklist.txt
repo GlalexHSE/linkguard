@@ -1,0 +1,8 @@
+# Учебный чёрный список фишинговых доменов
+evil.example
+phishing-bank.example
+free-iphone.example
+paypa1.com
+g00gle-login.com
+sberbank-online-verify.ru
+gosuslugi-pay.ru

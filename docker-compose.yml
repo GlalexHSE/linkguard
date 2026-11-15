@@ -1,0 +1,207 @@
+name: linkguard
+
+x-pg-common: &pg-common
+  image: postgres:17
+  entrypoint: ["/bin/bash", "/opt/pg/pg-entrypoint.sh"]
+  environment: &pg-env
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    REPL_PASSWORD: ${REPL_PASSWORD}
+  restart: "no"
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+
+x-rabbit-common: &rabbit-common
+  image: rabbitmq:4.1-management
+  environment:
+    RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+    RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE}
+  volumes:
+    - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/20-cluster.conf:ro
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+    interval: 5s
+    timeout: 10s
+    retries: 30
+
+x-amqp-env: &amqp-env
+  AMQP_HOSTS: rabbit1,rabbit2,rabbit3
+  AMQP_USER: ${RABBITMQ_USER}
+  AMQP_PASSWORD: ${RABBITMQ_PASSWORD}
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    networks:
+      edge:
+        ipv4_address: 172.30.1.10
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    environment:
+      <<: *amqp-env
+      PG_DSN: "host=pg1,pg2 port=5432,5432 dbname=${POSTGRES_DB} user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} target_session_attrs=read-write connect_timeout=2"
+      REDIS_HOST: redis
+    depends_on:
+      pg1:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbit1:
+        condition: service_healthy
+      rabbit2:
+        condition: service_healthy
+      rabbit3:
+        condition: service_healthy
+    networks:
+      edge:
+        ipv4_address: 172.30.1.20
+      data:
+        ipv4_address: 172.30.2.20
+      broker:
+        ipv4_address: 172.30.3.20
+    restart: unless-stopped
+
+  scanner:
+    build: ./scanner
+    environment:
+      <<: *amqp-env
+    depends_on:
+      rabbit1:
+        condition: service_healthy
+      rabbit2:
+        condition: service_healthy
+      rabbit3:
+        condition: service_healthy
+    networks:
+      broker:
+        ipv4_address: 172.30.3.30
+    restart: unless-stopped
+
+  pg1:
+    <<: *pg-common
+    hostname: pg1
+    environment:
+      <<: *pg-env
+      REPLICATE_FROM: ${PG1_REPLICATE_FROM:-}
+    volumes:
+      - pg1-data:/var/lib/postgresql/data
+      - ./db:/opt/pg:ro
+    networks:
+      data:
+        ipv4_address: 172.30.2.31
+
+  pg2:
+    <<: *pg-common
+    hostname: pg2
+    environment:
+      <<: *pg-env
+      REPLICATE_FROM: ${PG2_REPLICATE_FROM:-pg1}
+    depends_on:
+      pg1:
+        condition: service_healthy
+    volumes:
+      - pg2-data:/var/lib/postgresql/data
+      - ./db:/opt/pg:ro
+    networks:
+      data:
+        ipv4_address: 172.30.2.32
+
+  pg-watchdog:
+    build: ./watchdog
+    environment:
+      PG_NODES: pg1,pg2
+      PG_USER: ${POSTGRES_USER}
+      PG_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_DB: ${POSTGRES_DB}
+    depends_on:
+      pg1:
+        condition: service_healthy
+    networks:
+      data:
+        ipv4_address: 172.30.2.50
+    restart: unless-stopped
+
+  backup:
+    image: postgres:17
+    entrypoint: ["/bin/bash", "/opt/backup/backup-loop.sh"]
+    environment:
+      PG_CONN: "host=pg1,pg2 dbname=${POSTGRES_DB} user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} target_session_attrs=read-write connect_timeout=2"
+      BACKUP_INTERVAL: 3600
+    volumes:
+      - ./backup:/opt/backup:ro
+      - ./backups:/backups
+    depends_on:
+      pg1:
+        condition: service_healthy
+    networks:
+      data:
+        ipv4_address: 172.30.2.60
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      data:
+        ipv4_address: 172.30.2.40
+    restart: unless-stopped
+
+  rabbit1:
+    <<: *rabbit-common
+    hostname: rabbit1
+    ports:
+      - "127.0.0.1:15672:15672"
+    networks:
+      broker:
+        ipv4_address: 172.30.3.11
+
+  rabbit2:
+    <<: *rabbit-common
+    hostname: rabbit2
+    networks:
+      broker:
+        ipv4_address: 172.30.3.12
+
+  rabbit3:
+    <<: *rabbit-common
+    hostname: rabbit3
+    networks:
+      broker:
+        ipv4_address: 172.30.3.13
+
+  firewall:
+    build: ./firewall
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    profiles: ["firewall"]
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+  data:
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
+  broker:
+    ipam:
+      config:
+        - subnet: 172.30.3.0/24
+
+volumes:
+  pg1-data:
+  pg2-data:
